@@ -1,0 +1,58 @@
+name: 自动同步上游 Tag
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'     # 每 6 小时检查一次（可改成每天：'0 0 * * *'）
+  workflow_dispatch:          # 支持手动触发测试
+
+jobs:
+  sync-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出你的 fork 仓库（带完整历史和 tag）
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_TOKEN }}  # 用你的 PAT 确保有推送权限
+          fetch-depth: 0                        # 必须全量拉取，才能拿到所有 tag
+
+      - name: 添加上游 remote（如果不存在）
+        run: |
+          git remote add upstream https://github.com/上游用户名/上游仓库名.git || true
+          # ← 这里一定要改成你真正的上游仓库地址，例如：
+          # https://github.com/onevcat/Kingfisher.git   （如果你 fork 的是 Kingfisher 原仓库）
+
+      - name: 从上游拉取所有 tag
+        run: git fetch upstream --tags --prune
+
+      - name: 同步新 tag 到你的 fork（创建 tag 并推送）
+        run: |
+          # 获取上游所有 tag
+          UPSTREAM_TAGS=$(git tag -l | grep -v '^synced-' | sort -u || true)
+          
+          if [ -z "$UPSTREAM_TAGS" ]; then
+            echo "上游没有 tag 或没有新 tag。"
+            exit 0
+          fi
+          
+          for TAG in $UPSTREAM_TAGS; do
+            # 检查 origin 上是否已存在这个 tag
+            if git rev-parse --quiet --verify "origin/${TAG}" >/dev/null; then
+              echo "Tag ${TAG} 已存在，跳过。"
+              continue
+            fi
+            
+            echo "发现新 tag：${TAG}，正在同步..."
+            
+            # 创建轻量 tag（指向上游 commit）
+            git tag "${TAG}" "refs/tags/${TAG}" || true
+            
+            # 推荐：创建带注释的 annotated tag（更好管理）
+            # git tag -a "${TAG}" -m "从上游同步于 $(date +%Y-%m-%d)" "refs/tags/${TAG}" || true
+            
+            # 推送到你的 fork
+            git push origin "${TAG}"
+            
+            echo "已推送 tag: ${TAG}"
+          done
+          
+          echo "tag 同步完成！"
