@@ -1,0 +1,111 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 0 点同步一次（北京时间 8 点）
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+          fetch-depth: 0  # 必须，否则拿不到所有 tag
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/gonzalezreal/swift-markdown-ui.git || true
+          git fetch upstream --tags --force
+
+      - name: Sync default branch (keep sync-upstream.yml)
+        run: |
+          git checkout main
+
+          # 备份 sync-upstream.yml
+          mkdir -p /tmp/keep
+          if [ -f .github/workflows/sync-upstream.yml ]; then
+            cp .github/workflows/sync-upstream.yml /tmp/keep/
+          fi
+
+          # 对齐上游 main
+          git reset --hard upstream/main
+
+          # 把 sync-upstream.yml 放回去
+          mkdir -p .github/workflows
+          if [ -f /tmp/keep/sync-upstream.yml ]; then
+            cp /tmp/keep/sync-upstream.yml .github/workflows/
+          fi
+
+          git add .github/workflows/sync-upstream.yml
+          git commit -m "chore: keep sync-upstream workflow" || echo "no changes to commit"
+
+          git push origin main --force
+
+      - name: Sync all branches (可选)
+        run: |
+          # 同步所有分支（除 main 外）
+          for branch in $(git branch -r | grep 'upstream/' | grep -v 'upstream/main' | sed 's|upstream/||'); do
+            git checkout -B $branch upstream/$branch
+            git push origin $branch --force
+          done
+          git checkout main
+
+      - name: Sync tags
+        run: |
+          # 把上游所有 tag 推到 fork
+          git push origin --tags --force
+
+      - name: Sync releases via gh CLI
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          UPSTREAM_REPO="gonzalezreal/swift-markdown-ui"
+          MY_REPO="${{ github.repository }}"
+
+          # 第一步：只拿 tagName（list 只支持这些字段）
+          gh release list --repo "$UPSTREAM_REPO" --limit 200 \
+            --json tagName > /tmp/tags.json
+
+          # 第二步：逐个 tag 用 view 取详情（含 body）
+          jq -r '.[].tagName' /tmp/tags.json | while read -r TAG; do
+            [ -z "$TAG" ] && continue
+
+            # 检查 fork 里是否已有该 release
+            if gh release view "$TAG" --repo "$MY_REPO" > /dev/null 2>&1; then
+              echo "Release $TAG 已存在，跳过"
+              continue
+            fi
+
+            echo "获取上游 release 详情: $TAG"
+            if ! gh release view "$TAG" --repo "$UPSTREAM_REPO" \
+              --json name,body,isDraft,isPrerelease > /tmp/detail.json; then
+              echo "获取 $TAG 详情失败，跳过"
+              continue
+            fi
+
+            NAME=$(jq -r '.name // ""' /tmp/detail.json)
+            BODY=$(jq -r '.body // ""' /tmp/detail.json)
+            DRAFT=$(jq -r '.isDraft' /tmp/detail.json)
+            PRE=$(jq -r '.isPrerelease' /tmp/detail.json)
+
+            echo "创建 release: $TAG"
+            gh release create "$TAG" \
+              --repo "$MY_REPO" \
+              --title "${NAME:-$TAG}" \
+              --notes "$BODY" \
+              --draft="$DRAFT" \
+              --prerelease="$PRE" \
+              || echo "创建 $TAG 失败（可能 tag 不存在）"
+          done
